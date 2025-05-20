@@ -1,5 +1,4 @@
 # encoding:utf-8
-#    Author:  a101269
 #    Date  :  2025/2/28
 import copy
 import argparse
