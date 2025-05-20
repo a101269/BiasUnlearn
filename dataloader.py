@@ -1,5 +1,4 @@
 # encoding:utf-8
-#    Author:  a101269
 #    Date  :  2025/4/2
 # Copyright (C) 2023 ByteDance. All Rights Reserved.
 #
