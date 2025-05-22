@@ -4,7 +4,7 @@
 pip install -r requirements.txt
 ```
 Prepare Data
-[data](https://github.com/McGill-NLP/bias-bench/tree/main/data/stereoset StereoSet)
+[data](https://github.com/McGill-NLP/bias-bench/tree/main/data/stereoset)
 
 train a debiased GPT model:
 
