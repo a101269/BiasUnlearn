@@ -3,6 +3,9 @@
 ```bash
 pip install -r requirements.txt
 ```
+Prepare Data
+[data](https://github.com/McGill-NLP/bias-bench/tree/main/data/stereoset StereoSet)
+
 train a debiased GPT model:
 
 ```bash
@@ -20,7 +23,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/default_con
     --use_lora \
     --model_save_dir "${exp}" \
     --log_file log.log \
-    --lr 4e-5 \
+    --lr 2e-5 \
     --max_unlearn_steps 1000 \
     --save_every 50 \
     --ster_weight 0.5 \
