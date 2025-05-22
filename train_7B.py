@@ -1,6 +1,6 @@
 # encoding:utf-8
 #    Date  :  2025/2/28
-import copy
+
 import argparse
 import logging
 import random
@@ -8,6 +8,8 @@ import time
 import torch.nn.functional as F
 import numpy as np
 import torch
+import os
+import json
 from itertools import cycle
 from tqdm import tqdm
 from accelerate import Accelerator, DeepSpeedPlugin
@@ -15,9 +17,12 @@ from peft import LoraConfig, TaskType, get_peft_model
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from dataloader import get_stereoset_answers_plaintext
-from torch.optim.lr_scheduler import SequentialLR, ConstantLR, CosineAnnealingLR, LinearLR
+from Evaluator import BiasEvaluator,ScoreEvaluator
+from torch.optim.lr_scheduler import SequentialLR, ConstantLR, CosineAnnealingLR,LinearLR
 from loss import lm_loss, compute_kl, DynamicWeightAdapter
-import yaml
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 torch.manual_seed(123)
 np.random.seed(123)
@@ -26,32 +31,103 @@ random.seed(123)
 target_map = {"gpt2": ["attn.c_proj", "attn.c_attn"],
               "qwen": ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'down_proj', 'up_proj'],
               "meta": ['q_proj', 'v_proj', 'k_proj', 'o_proj'],
-              "llama": ['up_proj', 'k_proj', 'o_proj', 'gate_proj', 'q_proj', 'v_proj', 'down_proj']
+              "llama": ['q_proj', 'v_proj', 'k_proj', 'o_proj'],
+              "mathstral": ['q_proj', 'v_proj', 'k_proj', 'o_proj'],
+       	        "mistral": ['q_proj', 'v_proj', 'k_proj', 'o_proj'],
               }
 bia_type = ['gender', 'profession', 'race', 'religion']
 type2id = {'gender': 0, 'profession': 1, 'race': 2, 'religion': 3}
 
+def eval(evaluator,model):
+    results = evaluator.evaluate(model)
+    score_evaluator = ScoreEvaluator(results)
+
+    overall = score_evaluator.get_overall_results()
+    res=score_evaluator.pretty_print(overall)
+    return res
+
+def train(first_turn,e1poch,idx,ster,anti,unrelate,model,tokenizer,device,pretrained_model,evaluator, optimizer, lr_scheduler,pre_res, accelerator ):
+    stop_FLAG=False
+    # while epoch < args.epoch and idx < args.max_unlearn_steps:
+    #     epoch += 1
+    while idx < args.max_unlearn_steps:
+
+        for star_batch, anti_batch, unrelate_batch in zip(ster, cycle(anti),cycle(unrelate)):  # 12766/4/4=797 epoch
+            # ster_loss = lm_loss("ga", star_batch, model, device=device, pad_id=tokenizer.pad_token_id)
+            ster_loss = lm_loss("gd", star_batch, model, device=device, pad_id=tokenizer.pad_token_id,
+                                weight=None)#weight_adapter.weights
+            ster_loss_ref = lm_loss("gd", star_batch, pretrained_model, device=device, pad_id=tokenizer.pad_token_id)
+            neg_log_ratio = ster_loss - ster_loss_ref
+            loss_npo = -F.logsigmoid(args.beta * neg_log_ratio).mean() * 2 / args.beta
+
+
+            # forget_mask = (ster_loss.detach() > 2.0).float()  # [batch_size]
+            # loss_npo = (-F.logsigmoid(args.beta * neg_log_ratio) * forget_mask).mean() * 2 / args.beta
+
+
+            # kl_loss = compute_kl(pretrained_model, model, unrelate_batch, device)
+            # loss = loss_npo * args.ster_weight + args.kl_weight * kl_loss
+
+            anti_loss = lm_loss("gd", anti_batch, model, device=device, pad_id=tokenizer.pad_token_id,
+                                weight=None) #weight_adapter.weights
+            kl_loss = compute_kl(pretrained_model, model, unrelate_batch, device)
+            # loss2 = args.anti_weight * anti_loss + args.kl_weight * kl_loss
+
+            loss = args.ster_weight * loss_npo + args.anti_weight * anti_loss + args.kl_weight * kl_loss
+
+            # Backprop.
+            accelerator.backward(loss)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            current_lr = lr_scheduler.get_last_lr()[0]
+
+            # print("current_lr",current_lr)
+            stats = (
+                f"batch: {idx}, "
+                f"lr: {current_lr:.8f} "
+                f"ster_loss: {args.ster_weight * ster_loss:.3f}, "
+                f"anti_loss: {args.anti_weight * anti_loss:.3f}, "
+                f"current_div_loss: {args.kl_weight * kl_loss:.3f}, "
+            )
+            logging.info(stats)
+            print(stats)
+            idx += 1
+
+            # Save model.
+
+            if first_turn :
+                if idx % args.save_every == 0:
+                    res = eval(evaluator, model)
+                    return res, idx
+            else:
+                if idx % args.eval_every == 0:
+                    try:
+                        model.save_pretrained("save/" + args.model_save_dir + "/" + args.model_save_dir + "_" + str(idx),safe_serialization=False)
+                    except:
+                        model.module.save_pretrained("save/" + args.model_save_dir + "/" + args.model_save_dir + "_" + str(idx),safe_serialization=False)
+                    logging.info("pre_res")
+                    print("pre_res")
+                    logging.info(pre_res)
+                    print(pre_res)
+                    res = eval(evaluator, model)
+                    return res,idx
+            # if idx % args.save_every == 0:
+            #     try:
+            #         model.save_pretrained("save/"+args.model_save_dir + "/"+args.model_save_dir + "_" + str(idx), safe_serialization=False)
+            #     except:
+            #         model.module.save_pretrained("save/"+args.model_save_dir + "/"+args.model_save_dir + "_" + str(idx), safe_serialization=False)
+            #     logging.info(f"saved model at step {idx}")
+            #     print(f"saved model at step {idx}")
+    res = eval(evaluator, model)
+    return res, idx
 
 def main(args) -> None:
-
-    # deepspeed_plugin = DeepSpeedPlugin(zero_stage=3)#,offload_optimizer_device="cpu")
-    # deepspeed_plugin = DeepSpeedPlugin(
-    #     zero_stage=3,
-    #     zero3_param_persistence_threshold= {"params": ["*.embedding.weight"], "no_shard": True}
-    # )
-    # ds_config = {
-    #     "zero_optimization": {
-    #         "stage": 3,
-    #         "exclude_embedding": True,  # 关键配置：排除 Embedding 层
-    #     },
-        # 其他配置...
-    # }
     deepspeed_plugin1 = DeepSpeedPlugin()
     deepspeed_plugin2 = DeepSpeedPlugin()
-    plugins = {"student": deepspeed_plugin1 , "teacher": deepspeed_plugin2}
+    plugins = {"student": deepspeed_plugin1, "teacher": deepspeed_plugin2}
 
     accelerator = Accelerator(deepspeed_plugin=plugins)
-
     device = accelerator.device
     model = AutoModelForCausalLM.from_pretrained(args.model_name)
     # use LoRA.
@@ -78,24 +154,17 @@ def main(args) -> None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # logging.info("tokenizer.pad_token_id")
-    # print("tokenizer.pad_token_id")
-    # logging.info(tokenizer.pad_token_id)
-    # print(tokenizer.pad_token_id)
-    # Load  data.
-    anti_dataloader, ster_dataloader, unrelate_dataloader = get_stereoset_answers_plaintext(tokenizer,
+    evaluator = BiasEvaluator(tokenizer=tokenizer)
+
+
+    anti_dataloader, ster_dataloader, unrelate_dataloader, ster_race_dataloader,ster_gender_dataloader,ster_profession_dataloader,ster_religion_dataloader,anti_race_dataloader,anti_gender_dataloader,anti_profession_dataloader,anti_religion_dataloader = get_stereoset_answers_plaintext(tokenizer,
                                                                                             mix_anti=args.mix_anti,
                                                                                             ster_batch_size=args.ster_batch_size,
                                                                                             batch_size=args.batch_size,
                                                                                             type2id=type2id)
 
+
     optimizer = AdamW(model.parameters(), lr=args.lr)
-    # optimizer2 = AdamW(model.parameters(), lr=args.lr)
-    # from torch.optim.lr_scheduler import LambdaLR
-    # lr_scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
-    # from torch.optim.lr_scheduler import CosineAnnealingLR
-    # min_lr = 1e-6  # 最小学习率
-    # lr_scheduler = CosineAnnealingLR(optimizer, T_max=3000, eta_min=min_lr)
     device_count = torch.cuda.device_count()
     num_training_steps = min(args.max_unlearn_steps * device_count, len(ster_dataloader) * args.epoch)
     logging.info("num_training_steps,"+str(num_training_steps))
@@ -103,26 +172,13 @@ def main(args) -> None:
     logging.info("len(ster_dataloader) * args.epoch"+str(len(ster_dataloader) * args.epoch))
     print("len(ster_dataloader) * args.epoch" + str(len(ster_dataloader) * args.epoch)) # 12912
 
+
     lr_scheduler = get_scheduler( #cosine
         name="linear",
         optimizer=optimizer,
         num_warmup_steps= 10 ,
-        num_training_steps = num_training_steps* args.epoch, #llama3
+        num_training_steps = num_training_steps*1.2,
     )
-
-    # lr_scheduler = get_scheduler( #cosine
-    #     name="linear",
-    #     optimizer=optimizer,
-    #     num_warmup_steps= 10 ,
-    #     num_training_steps = num_training_steps*1.2, #GPT-large
-    # )
-
-    # lr_scheduler = get_scheduler(
-    #     name="linear",
-    #     optimizer=optimizer,
-    #     num_warmup_steps= 10 ,
-    #     num_training_steps = len(ster_dataloader) * 3, #GPT-mid
-    # )
 
     typecount = {'gender': 1522, 'profession': 4833, 'race': 5923, 'religion': 488}
     init_weight = {'gender': 0.26, 'profession': 0.15, 'race': 0.13, 'religion': 0.46}
@@ -131,28 +187,43 @@ def main(args) -> None:
     print("anti_dataloader get_stereoset_answers_plaintext")
     print(anti_dataloader)
 
-    ref_model = AutoModelForCausalLM.from_pretrained(args.model_name)
-    # ref_model = copy.deepcopy(model)
-    ref_model.to(device)
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False
 
-    model, optimizer,  anti_dataloader, ster_dataloader, unrelate_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer,  anti_dataloader, ster_dataloader, unrelate_dataloader, lr_scheduler,
+    model, optimizer,  anti_dataloader, ster_dataloader, unrelate_dataloader, ster_race_dataloader,ster_gender_dataloader,ster_profession_dataloader,ster_religion_dataloader,anti_race_dataloader,anti_gender_dataloader,anti_profession_dataloader,anti_religion_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer,  anti_dataloader, ster_dataloader, unrelate_dataloader, ster_race_dataloader,ster_gender_dataloader,ster_profession_dataloader,ster_religion_dataloader,anti_race_dataloader,anti_gender_dataloader,anti_profession_dataloader,anti_religion_dataloader, lr_scheduler
     )
 
-    ref_model= accelerator.prepare(ref_model)
+
+
+
+
+    category_map = {
+        "ster": {
+            "race": ster_race_dataloader,
+            "gender": ster_gender_dataloader,
+            "profession": ster_profession_dataloader,
+            "religion": ster_religion_dataloader
+        },
+        "anti": {
+            "race": anti_race_dataloader,
+            "gender": anti_gender_dataloader,
+            "profession": anti_profession_dataloader,
+            "religion": anti_religion_dataloader
+        }
+    }
 
     print("anti_dataloader accelerator.prepare")
     print(anti_dataloader)
-
-
-    # deepspeed_plugin1.enable()
-
-    # Reference model for computing KL.
     model.train()
 
+    # Reference model for computing KL.
+
+    pretrained_model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    pretrained_model.to(device)
+    for param in pretrained_model.parameters():
+        param.requires_grad = False
+
+    pretrained_model.eval()
+    pretrained_model= accelerator.prepare(pretrained_model)
     # Start unlearning.
     ster_loss = 0.0
     idx = 0
@@ -168,112 +239,78 @@ def main(args) -> None:
     logging.info("len ster_dataloader")
     logging.info(len(ster_dataloader))
     print(ster_dataloader)
-    tmp = args.save_every
-    # while ster_loss < args.max_ster_loss and idx < args.max_unlearn_steps:
-    while epoch < args.epoch and idx < args.max_unlearn_steps:
-        epoch += 1
-        for star_batch, anti_batch, unrelate_batch in zip(ster_dataloader, cycle(anti_dataloader),
-                                                          cycle(unrelate_dataloader)):  # 12766/4/4=797 epoch
-            # if idx > 800 and idx < 1600:
-            #     args.lr = 3e-6
-            # elif idx > 1600:
-            #     args.lr = 2e-6
+    current_ster = ster_dataloader
+    current_anti = anti_dataloader
+    reverse=False
+    first_turn=True
+    pre_res=None
+    while idx < args.max_unlearn_steps :
+        if reverse:
+            scores, idx = train(first_turn, epoch, idx, current_anti, current_ster, unrelate_dataloader, model, tokenizer, device, pretrained_model, evaluator, optimizer, lr_scheduler,pre_res, accelerator )
+        else:
+            scores, idx = train(first_turn, epoch, idx, current_ster, current_anti, unrelate_dataloader, model,tokenizer, device, pretrained_model, evaluator, optimizer, lr_scheduler, pre_res, accelerator )
 
-            if idx % 100 == 0 and args.reinit:
-                accelerator.free_memory(optimizer)
-                del optimizer
-                optimizer = AdamW(model.parameters(), lr=args.lr)
-                num_training_steps = args.max_unlearn_steps
-                lr_scheduler = get_scheduler(
-                    name="linear",
-                    optimizer=optimizer,
-                    num_warmup_steps=0,
-                    num_training_steps=num_training_steps,
-                )
-                (optimizer, lr_scheduler) = accelerator.prepare(optimizer, lr_scheduler)
+        pre_res=scores
+        bases = [50,50,50,50]
 
-            # ster_loss = lm_loss("ga", star_batch, model, device=device, pad_id=tokenizer.pad_token_id)
-            ster_loss = lm_loss("gd", star_batch, model, device=device, pad_id=tokenizer.pad_token_id,
-                                weight=None)#weight_adapter.weights
-            ster_loss_ref = lm_loss("gd", star_batch, ref_model, device=device, pad_id=tokenizer.pad_token_id)
-            neg_log_ratio = ster_loss - ster_loss_ref
-            loss_npo = -F.logsigmoid(args.beta * neg_log_ratio).mean() * 2 / args.beta
+        gaps = [abs(float(score) - bases[i]) for i, score in enumerate(scores[:4])]
+        if all(gap < 2 for gap in gaps):
+            try:
+                model.save_pretrained("save/" + args.model_save_dir + "/" + args.model_save_dir + "_" + str(idx), safe_serialization=False)
+            except:
+                model.module.save_pretrained("save/" + args.model_save_dir + "/" + args.model_save_dir + "_" + str(idx), safe_serialization=False)
+            logging.info(f"saved model at step {idx}")
+            end_time = time.time()
+            logging.info("Total time: %d sec" % (end_time - start_time))
 
-            # 在数据加载阶段添加遗忘标记
-            # forget_mask = (ster_loss.detach() > 2.0).float()  # [batch_size]
-            # loss_npo = (-F.logsigmoid(args.beta * neg_log_ratio) * forget_mask).mean() * 2 / args.beta
+            # if args.use_lora:
+            #     model = model.merge_and_unload()
+            logging.info("Unlearning finished")
+            return
 
+        max_gap_idx = gaps.index(max(gaps))
+        selected_category = bia_type[max_gap_idx]
+        if float(scores[max_gap_idx])< bases[max_gap_idx]:
+            reverse = True
+        else:
+            reverse = False
+        if max(gaps)>5:
+            fineturn_lr=args.lr
+            fineturn_steps=3000 if idx<300 else 1000
+            args.eval_every=30 if idx<300 else 15
+        elif 3<max(gaps)<=5:
+            fineturn_lr = args.lr*4/5
+            fineturn_steps=200
+            args.eval_every = 10 if idx<300 else 5
+        elif max(gaps)<=3:
+            fineturn_lr = args.lr*3/5
+            fineturn_steps = 200
+            args.eval_every = 3
 
-            # kl_loss = compute_kl(ref_model, model, unrelate_batch, device)
-            # loss = loss_npo * args.ster_weight + args.kl_weight * kl_loss
+        current_ster = category_map['ster'][selected_category]
+        current_anti = category_map['anti'][selected_category]
+        first_turn=False
 
-            anti_loss = lm_loss("gd", anti_batch, model, device=device, pad_id=tokenizer.pad_token_id,
-                                weight=None)  # weight_adapter.weights
-            kl_loss = compute_kl(ref_model, model, unrelate_batch, device)
-            # loss2 = args.anti_weight * anti_loss + args.kl_weight * kl_loss
+        # accelerator.free_memory(optimizer)
+        # accelerator.free_memory(lr_scheduler)
+        # # args.save_every=10
+        # del optimizer
+        # del lr_scheduler
+        # optimizer = AdamW(model.parameters(), lr=fineturn_lr)
+        # lr_scheduler = get_scheduler(
+        #     name="linear",
+        #     optimizer=optimizer,
+        #     num_warmup_steps=5,
+        #     num_training_steps=fineturn_steps,
+        # )
+        # (optimizer, lr_scheduler) = accelerator.prepare(optimizer, lr_scheduler)
 
-            loss = args.ster_weight * loss_npo + args.anti_weight * anti_loss + args.kl_weight * kl_loss
-
-            # Backprop.
-            accelerator.backward(loss)
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
-            current_lr = lr_scheduler.get_last_lr()[0]
-
-            # print("current_lr",current_lr)
-            stats = (
-                f"batch: {idx}, "
-                f"lr: {current_lr:.8f} "
-                f"ster_loss: {args.ster_weight * ster_loss:.3f}, "
-                f"anti_loss: {args.anti_weight * anti_loss:.3f}, "
-                f"current_div_loss: {args.kl_weight * kl_loss:.3f}, "
-            )
-            logging.info(stats)
-            print(stats)
-            idx += 1
-
-            # Save model.
-
-            if idx>400 and idx<500:
-
-                args.save_every=20
-            else:
-                args.save_every=tmp
-            if idx % args.save_every == 0 or idx == 100:
-                try:
-                    model.save_pretrained("save/"+args.model_save_dir + "/"+args.model_save_dir + "_" + str(idx), safe_serialization=False)
-                except:
-                    model.module.save_pretrained("save/"+args.model_save_dir + "/"+args.model_save_dir + "_" + str(idx), safe_serialization=False)
-                logging.info(f"saved model at step {idx}")
-                print(f"saved model at step {idx}")
-            if args.anti_weight * anti_loss < min_anti_loss:
-                stop_FLAG = True
-                break
-        if stop_FLAG:
-            break
-    end_time = time.time()
-    logging.info("Total time: %d sec" % (end_time - start_time))
-
-    # if args.use_lora:
-    #     model = model.merge_and_unload()
-
-    # Save final model.
-
-    # try:
-    #     model.save_pretrained(args.model_save_dir, safe_serialization=False)
-    # except:
-    #     model.module.save_pretrained(args.model_save_dir, safe_serialization=False)
-    logging.info("Unlearning finished")
-
-    return
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--config_file", type=str, help="config file",)
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--reinit", action="store_true")
     parser.add_argument("--mix_anti", action="store_true")
@@ -330,7 +367,10 @@ if __name__ == "__main__":
         help="Directory to save model.",
     )
     parser.add_argument(
-        "--save_every", type=int, default=800, help="How many steps to save model."
+        "--save_every", type=int, default=100, help="How many steps to save model."
+    )
+    parser.add_argument(
+        "--eval_every", type=int, default=30, help="How many steps to save model."
     )
     parser.add_argument(
         "--log_file",
@@ -347,10 +387,7 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d-%H-%M",
         level=logging.INFO,
     )
-
-
     for arg in vars(args):
         logging.info(f"{arg}: {getattr(args, arg)}")
     main(args)
-
 
