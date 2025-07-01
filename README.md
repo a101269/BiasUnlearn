@@ -1,5 +1,7 @@
 ## BiasUnlearn
 
+![alt](performance_comparison_final.png)
+
 ```bash
 pip install -r requirements.txt
 ```
