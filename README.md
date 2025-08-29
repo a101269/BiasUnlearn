@@ -1,4 +1,4 @@
-## BiasUnlearn
+# BiasUnlearn
 
 ![alt](performance_comparison_final.png)
 
@@ -6,17 +6,17 @@
 pip install -r requirements.txt
 ```
 
-Prepare Data
+## Prepare Data
 [data](https://github.com/McGill-NLP/bias-bench/tree/main/data/stereoset)
 
 
-Train a debiased GPT model:
+## Train a debiased GPT model:
 
 ```bash
 bash run.sh
 ```
 
-Train a debiased 7B model:
+## Train a debiased 7B model:
 ```bash
 
 exp=gpt-m-new
@@ -36,4 +36,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file configs/default_con
     --mix_anti \
     2>&1 | tee "log/${exp}.log"
 
+```
+
+## Reference
+
+```
+@inproceedings{
+liu2025mitigating,
+title={Mitigating Biases in Language Models via Bias Unlearning},
+author={Dianqing Liu and Yi Liu and Guoqing Jin and Zhendong Mao},
+booktitle={The 2025 Conference on Empirical Methods in Natural Language Processing},
+year={2025},
+}
 ```
