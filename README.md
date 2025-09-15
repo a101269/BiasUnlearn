@@ -1,5 +1,7 @@
 # BiasUnlearn
 
+Code for EMNLP2025 paper "Mitigating Biases in Language Models via Bias Unlearning"
+
 ![alt](performance_comparison_final.png)
 
 ```bash
